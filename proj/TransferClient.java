@@ -17,7 +17,7 @@ public class TransferClient extends FishThread {
     private long interval;
     private byte[] buf;
 
-    public static final long DEFAULT_CLIENT_INTERVAL = 1000;
+    public static final long DEFAULT_CLIENT_INTERVAL = 3000;
     public static final int DEFAULT_BUFFER_SZ = 65536;
 
     // number of bytes to send
@@ -63,9 +63,9 @@ public class TransferClient extends FishThread {
 
             if (amount == 0) {
                 // sending completed, initiate closure of connection
-                node.logOutput("time = " + manager.now());
-                node.logOutput("sending completed");
-                node.logOutput("closing connection...");
+                // node.logOutput("time = " + manager.now());
+                // node.logOutput("sending completed");
+                // node.logOutput("closing connection...");
                 sock.close();
                 return;
             }

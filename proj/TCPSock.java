@@ -13,6 +13,7 @@
 import java.nio.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.lang.reflect.Method;
 
 public class TCPSock {
     // TCP socket states
@@ -40,13 +41,23 @@ public class TCPSock {
     private Node node;
     private TCPManager tcpMan;
 
+    private TCPSockSender sender;
+    private TCPSockReceiver receiver;
+
     private int myPort;
     private int destAddr;
     private int destPort;
     private boolean bound = false; //if bind to a port
     private ArrayBlockingQueue<TCPSock> socketQueue; 
-    private int seqNum;
-    private ByteBuffer dataBuffer = ByteBuffer.allocate(DEFAULT_BUFFER_SZ);
+    private int nextSeqNum;
+    private int expectedSeqNum;
+    private ByteBuffer receiverBuffer = ByteBuffer.allocate(DEFAULT_BUFFER_SZ);
+    private ByteBuffer senderBuffer = ByteBuffer.allocate(DEFAULT_BUFFER_SZ);
+
+
+    private Segment prevACKSegment;
+    private int prevACK;
+    private int curCloseTimerId;
 
     public static final int DEFAULT_BUFFER_SZ = 65536;
 
@@ -54,15 +65,17 @@ public class TCPSock {
     public TCPSock(TCPManager manager, Node node) {
         this.node = node;
         this.tcpMan = manager;
-        this.seqNum = 0;
+        this.nextSeqNum = 0;
         this.role = Role.UNDETERMINED;
+        this.prevACK = -1;
+        this.curCloseTimerId = 0;
     }
 
     private TCPSock(TCPManager manager, Node node, int destAddr, int destPort, int myPort,  
         Transport transport) 
     {
         this(manager, node);
-        this.seqNum = transport.getSeqNum()+1;
+        this.expectedSeqNum = transport.getSeqNum()+1;
         state = State.ESTABLISHED;
         role = Role.RECEIVER;
         this.myPort = myPort;
@@ -102,6 +115,7 @@ public class TCPSock {
         if(!bound) return -1;
         this.state = State.LISTEN;
         this.role = Role.LISTENER;
+
         this.socketQueue = new ArrayBlockingQueue<>(backlog);
         return 0;
     }
@@ -115,6 +129,7 @@ public class TCPSock {
         if (this.role != Role.LISTENER) return null;
         return this.socketQueue.poll();
     }
+
 
     public boolean isConnectionPending() {
         return (state == State.SYN_SENT);
@@ -144,8 +159,12 @@ public class TCPSock {
         if(!bound) return -1;
         this.destAddr = destAddr;
         this.destPort = destPort;
-        send(Transport.SYN, 0, this.seqNum, new byte[0]);
-        this.seqNum += 1;
+
+        sender = new TCPSockSender(this);
+        sender.send(Transport.SYN,new byte[0]);
+        sender.incrementSeqNum(1);
+        // send(Transport.SYN, 0, this.nextSeqNum, new byte[0]);
+        // this.nextSeqNum += 1;
         this.state = State.SYN_SENT;
         this.role = Role.SENDER;
         return 0;
@@ -158,10 +177,15 @@ public class TCPSock {
     public void close() {
         if(this.role == Role.LISTENER || this.role == Role.UNDETERMINED)
             return;
-        this.seqNum++;
-        send(Transport.FIN,0,this.seqNum, new byte[0]);
+        if(!sender.hasEmptyBuffer()){
+            sender.sendNextSegment();
+            return;
+        }
+        sender.send(Transport.FIN,new byte[0]);
+        sender.incrementSeqNum(1);
+        // send(Transport.FIN,0,this.nextSeqNum, new byte[0]);
+        // this.nextSeqNum++;
         this.state = State.SHUTDOWN;
-        logOutput("Sent FIN (" + this.seqNum + ")");
     }
 
     /**
@@ -191,17 +215,19 @@ public class TCPSock {
      * @return int on success, the number of bytes written, which may be smaller
      *             than len; on failure, -1
      */
+
     public int write(byte[] buf, int pos, int len) {
         if(isClosed() || this.role!=Role.SENDER) return -1;
-        len = Math.min(Transport.MAX_PAYLOAD_SIZE,len);
+        // len = Math.min(Transport.MAX_PAYLOAD_SIZE,len);
         int written = 0;
         byte[] payload = new byte[len];
-        for (int i = 0; i < Math.min(len,buf.length-pos); i++ ) {
+        for (int i = 0; i < Math.min(len,senderBuffer.remaining()); i++ ) {
             payload[i] = buf[pos+i];
             written++;
         }
-        send(Transport.DATA,0,this.seqNum,payload);
-
+        // send(Transport.DATA,0,this.nextSeqNum,payload);
+        // senderBuffer.put(payload);
+        sender.writeToBuffer(payload);
         return written;
     }
 
@@ -218,10 +244,10 @@ public class TCPSock {
     public int read(byte[] buf, int pos, int len) {
         if(isClosed() || this.role!=Role.RECEIVER)
             return -1;
-        dataBuffer.flip();
-        int read = Math.min(dataBuffer.remaining(), len);
-        dataBuffer.get(buf, pos, read);
-        dataBuffer.compact();
+        receiverBuffer.flip();
+        int read = Math.min(receiverBuffer.remaining(), len);
+        receiverBuffer.get(buf, pos, read);
+        receiverBuffer.compact();
 
         return read;
     }
@@ -229,21 +255,13 @@ public class TCPSock {
     /*
      * End of socket API
      */
-
-    public void send(int type, int window, int seqNum, byte[] payload){
-        this.node.logOutput("Send from "+this.myPort+" to "+this.destAddr+"."+this.destPort + " Seq num: "+seqNum);
+    public void send(int type, int window, int seqNum, byte[] payload) {
         this.tcpMan.send(this.myPort, this.destAddr, this.destPort, 
             type, window, seqNum, payload);
-        this.seqNum += payload.length;
         switch(type){
             case Transport.DATA: 
                 logOutput(".");
                 logCode(".");
-
-                // Method method = Callback.getMethod("timeout", this, null);
-                // Callback cb = new Callback(method, this, null);
-                // addTimer(seqNum,cb)
-
                 break;
                 // System.out.print(".");
             case Transport.SYN: 
@@ -255,14 +273,72 @@ public class TCPSock {
                 logOutput("F");
                 logCode("F");
                 break;
-                // System.out.print("F");
-
         }
     }
+
+    public void sendACK(){
+        this.logOutput("Send ACK with seqNum: "+this.expectedSeqNum);
+        prevACKSegment = new Segment(Transport.ACK,this.expectedSeqNum,new byte[0]);
+        send(Transport.ACK,0,this.expectedSeqNum,new byte[0]);
+    }
+
+    public void resendACK(){
+        this.logCode("!");
+        send(prevACKSegment.getType(),0,prevACKSegment.getSeqNum(),prevACKSegment.getPayload());
+    }
+
+    // public void send(int type, int window, int seqNum, byte[] payload){
+
+    //     this.node.logOutput("Send from "+this.myPort+" to "+this.destAddr+"."+this.destPort + " Seq num: "+seqNum);
+    //     this.tcpMan.send(this.myPort, this.destAddr, this.destPort, 
+    //         type, window, seqNum, payload);
+
+    //     prevSegment = new Segment(type,seqNum,payload);
+    //     if(this.role != Role.RECEIVER){
+    //         try {
+    //             String[] types = {"java.lang.Integer"};
+    //             Object[] params = { seqNum };
+    //             Method method = Callback.getMethod("timeout", this, types);
+    //             Callback cb = new Callback(method, this, params);
+    //             this.node.getManager().addTimer(this.node.getAddress(), 1000, cb);
+    //         }catch(Exception e) {
+    //             this.node.logError("Failed to add timer callback. Method Name: " +
+    //                  "\nException: " + e);
+    //         }
+    //     }   
+    //     // if(this.role == Role.SENDER)
+    //     this.nextSeqNum += payload.length;
+
+    //     switch(type){
+    //         case Transport.DATA: 
+    //             logOutput(".");
+    //             logCode(".");
+    //             break;
+    //             // System.out.print(".");
+    //         case Transport.SYN: 
+    //             logOutput("S");
+    //             logCode("S");
+    //             break;
+    //             // System.out.print("S");
+    //         case Transport.FIN: 
+    //             logOutput("F");
+    //             logCode("F");
+    //             break;
+    //             // System.out.print("F");
+    //     }
+    // }
 
 
     public void receive(int srcAddr, int srcPort, Transport transport){
         if(isClosed()) return;
+        if(transport.getSeqNum() == prevACK){
+            sendACK();
+            return;
+        }
+        else{
+            prevACK = transport.getSeqNum();
+        }
+        // }
         switch (transport.getType()) {
             case Transport.SYN:
                 receiveSYN(srcAddr, srcPort, transport);
@@ -287,7 +363,7 @@ public class TCPSock {
         logOutput("S");
         logCode("S");
         if(this.role == Role.RECEIVER){
-            sendACK();
+            resendACK();
             return;
         }
         else{
@@ -318,97 +394,135 @@ public class TCPSock {
 
     public void receiveACK(Transport transport){
         if(this.role != Role.SENDER) return;
+        logOutput("Receive ACK for seq num: "+transport.getSeqNum());
+        sender.incrementTimer();
+        receiveACKforData(transport);
         receiveACKforSYN(transport);
         receiveACKforFIN(transport);
-
     }
 
 
     private void receiveACKforSYN(Transport transport){
         if(!isConnectionPending()) return;
 
-        if(transport.getSeqNum()!=this.seqNum){
+        if(transport.getSeqNum()!=this.sender.getNextSeqNum()){
             this.node.logOutput("?");
             logCode("?");
-            this.tcpMan.logError("SYN ACK seq number mismatch!");
+            this.tcpMan.logError("SYN ACK seq number mismatch!"+this.sender.getNextSeqNum()+ " : "+transport.getSeqNum());
         }
         else{
             this.state = State.ESTABLISHED;
-            // client.setSendBase(client.getNextSeqNum() + 1);
             logOutput("Connected!");
             logOutput(":");
             logCode(":");
+            sender.sendNextSegment();
         }
     }
 
     private void receiveACKforFIN(Transport transport){
         if (!isClosurePending()) return;
 
-        if(transport.getSeqNum()!=this.seqNum){
+        if(transport.getSeqNum()!=this.sender.getNextSeqNum()){
             this.node.logOutput("?");
             logCode("?");
-            this.tcpMan.logError("FIN ACK seq number mismatch!");
+            this.tcpMan.logError("FIN ACK seq number mismatch!"+this.sender.getNextSeqNum()+ " : "+transport.getSeqNum());
         }
         else{
             release();
-            // client.setSendBase(client.getNextSeqNum() + 1);
             logOutput("Closed!");
             logCode(":");
-            this.node.logOutput(":");
+            // this.node.logOutput(":");
         }    
     }
 
 
     private void receiveACKforData(Transport transport){
-        if(this.role!=Role.SENDER || isClosurePending() || isConnectionPending()) 
+        if(this.role!=Role.SENDER || !isConnected()) 
             return;
-
+        sender.receivedACKForData(transport.getSeqNum());
     }
+
+    // private void sendNextSegment(){
+    //     // this.logOutput("buffer size: "+senderBuffer.position());
+    //     if(senderBuffer.position()==0){
+    //         return;
+    //     }
+    //     int size = Math.min(senderBuffer.position(), Transport.MAX_PAYLOAD_SIZE);
+    //     byte[] payload = new byte[size];
+    //     senderBuffer.flip();
+    //     senderBuffer.get(payload, 0, size);
+    //     senderBuffer.compact();
+    //     send(Transport.DATA,0,this.nextSeqNum,payload);
+    // }
 
 
     private void receiveDATA(Transport transport){
         logOutput(".");   
         logCode(".");
         if(this.role != Role.RECEIVER) return;
-        dataBuffer.put(transport.getPayload());
-
+        receiverBuffer.put(transport.getPayload());
+        this.expectedSeqNum += transport.getPayload().length;
+        sendACK();
     }
 
     private void receiveFIN(Transport transport){
         logOutput("F");
         logCode("F");
         if(this.role != Role.RECEIVER) return;
-        this.seqNum = transport.getSeqNum();
+        this.expectedSeqNum = transport.getSeqNum()+1;
+        this.curCloseTimerId++;
         sendACK();
-        release();
+        logOutput("Wait for a while before release");
+        try {
+            String[] types = {"java.lang.Integer"};
+            Object[] params = { this.curCloseTimerId };
+            Method method = Callback.getMethod("closeTimeout", this, types);
+            Callback cb = new Callback(method, this, params);
+            this.node.getManager().addTimer(this.node.getAddress(), 2000, cb);
+        }catch(Exception e) {
+            this.node.logError("Failed to add timer callback. Method Name: " +
+                 "\nException: " + e);
+        }
     }
 
 /**
 LISTENER Socket API
 **/
-    private void sendACK(){
-        send(Transport.ACK, 0, this.seqNum, new byte[0]);
-    }
 
-    private void logOutput(String output){
+    public void logOutput(String output){
         if(LOG) this.node.logOutput(output);
     }
 
-    private void logCode(String output){
+    public void logError(String output){
+        this.node.logError(output);
+    }
+
+    public void logCode(String output){
         if(!LOG) System.out.print(output);
     }
 
-    public void timeout(int seq){
 
+    public void closeTimeout(Integer timerID){
+        // if previous segment has 0 payload, it means it is a syn, ack, or fin.
+        // if(prevSegment.getPayload().length == 0){
+        //     seq++;
+        // }
+        if(timerID == curCloseTimerId){
+            logOutput("closing");
+            release();
+        }
+        else{
+            // logOutput("Timing out: " + seq + " No Resend!");
+        }
     }
 
-    private void addTimer(long deltaT, Callback cb) {
-        try {
-            this.node.getManager().addTimer(this.node.getAddress(), deltaT, cb);
-        }catch(Exception e) {
-            this.node.logError("Failed to add timer callback. Method Name: " +
-                 "\nException: " + e);
-        }
+    // private void resend(Segment prevSegment){
+    //     this.nextSeqNum -= prevSegment.getPayload().length;
+    //     send(prevSegment.getType(),0,prevSegment.getSeqNum(),prevSegment.getPayload());
+    // }
+
+    public Node getNode(){
+        return this.node;
     }
 
 
