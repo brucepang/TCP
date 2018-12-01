@@ -9,6 +9,7 @@ public class TCPSockSender {
 	private TCPSock sock;
 	private int nextSeqNum;
 	private Segment prevSegment;
+    private boolean prevSegmentAcked = false;
     private ByteBuffer senderBuffer = ByteBuffer.allocate(DEFAULT_BUFFER_SZ);
 
     private int curTimerId;
@@ -32,6 +33,7 @@ public class TCPSockSender {
 
 	public void send(int type, int seqNum, byte[] payload){
 		this.sock.send(type,0,seqNum,payload);
+        prevSegmentAcked = false;
 		prevSegment = new Segment(type,seqNum,payload);
 
 		try {
@@ -104,5 +106,13 @@ public class TCPSockSender {
 
     public boolean hasEmptyBuffer(){
         return senderBuffer.position()==0;
+    }
+
+    public void setSegmengAcked(){
+        prevSegmentAcked = true;
+    }
+
+    public boolean allAcked(){
+        return prevSegmentAcked;
     }
 }

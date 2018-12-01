@@ -33,7 +33,7 @@ public class TCPSock {
         LISTENER
     }
 
-    private static final boolean LOG = true;
+    private static final boolean LOG = false;
     private static final int DEFAULT_TIMEOUT = 1000;
 
     private State state;
@@ -58,6 +58,8 @@ public class TCPSock {
     private Segment prevACKSegment;
     private int prevACK;
     private int curCloseTimerId;
+
+    private boolean closeTriggeredSend = false;
 
     public static final int DEFAULT_BUFFER_SZ = 65536;
 
@@ -178,7 +180,15 @@ public class TCPSock {
         if(this.role == Role.LISTENER || this.role == Role.UNDETERMINED)
             return;
         if(!sender.hasEmptyBuffer()){
-            sender.sendNextSegment();
+            if(!closeTriggeredSend){
+                closeTriggeredSend = true;
+                logOutput("Sending from close() method!");
+                sender.sendNextSegment();
+            }
+            return;
+        }
+        if(!sender.allAcked()){
+            logOutput("not close, waiting for ack.");
             return;
         }
         sender.send(Transport.FIN,new byte[0]);
@@ -284,6 +294,7 @@ public class TCPSock {
 
     public void resendACK(){
         this.logCode("!");
+        this.logOutput("Resend ACK with seqNum: "+prevACKSegment.getSeqNum());
         send(prevACKSegment.getType(),0,prevACKSegment.getSeqNum(),prevACKSegment.getPayload());
     }
 
@@ -332,7 +343,7 @@ public class TCPSock {
     public void receive(int srcAddr, int srcPort, Transport transport){
         if(isClosed()) return;
         if(transport.getSeqNum() == prevACK){
-            sendACK();
+            resendACK();
             return;
         }
         else{
@@ -395,6 +406,9 @@ public class TCPSock {
     public void receiveACK(Transport transport){
         if(this.role != Role.SENDER) return;
         logOutput("Receive ACK for seq num: "+transport.getSeqNum());
+        if(transport.getSeqNum() == sender.getNextSeqNum()){
+            sender.setSegmengAcked();
+        }
         sender.incrementTimer();
         receiveACKforData(transport);
         receiveACKforSYN(transport);
@@ -439,6 +453,7 @@ public class TCPSock {
     private void receiveACKforData(Transport transport){
         if(this.role!=Role.SENDER || !isConnected()) 
             return;
+        logCode(":");
         sender.receivedACKForData(transport.getSeqNum());
     }
 
@@ -478,7 +493,7 @@ public class TCPSock {
             Object[] params = { this.curCloseTimerId };
             Method method = Callback.getMethod("closeTimeout", this, types);
             Callback cb = new Callback(method, this, params);
-            this.node.getManager().addTimer(this.node.getAddress(), 2000, cb);
+            this.node.getManager().addTimer(this.node.getAddress(), 10000, cb);
         }catch(Exception e) {
             this.node.logError("Failed to add timer callback. Method Name: " +
                  "\nException: " + e);
